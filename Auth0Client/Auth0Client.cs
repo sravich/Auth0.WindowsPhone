@@ -10,6 +10,8 @@ using System.Net;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
+using System.Text.RegularExpressions;
+using System.Globalization;
 
 namespace Auth0.SDK
 {
@@ -18,8 +20,8 @@ namespace Auth0.SDK
     /// </summary>
     public partial class Auth0Client
     {
-        private const string AuthorizeUrl = "https://{0}/authorize?client_id={1}&scope={2}&redirect_uri={3}&response_type=token&connection={4}";
-        private const string LoginWidgetUrl = "https://{0}/login/?client={1}&scope={2}&redirect_uri={3}&response_type=token";
+        private const string AuthorizeUrl = "https://{0}/authorize?client_id={1}&scope={2}&redirect_uri={3}&response_type=token&connection={4}&device={5}";
+        private const string LoginWidgetUrl = "https://{0}/login/?client={1}&scope={2}&redirect_uri={3}&response_type=token&device={4}";
         private const string ResourceOwnerEndpoint = "https://{0}/oauth/ro";
         private const string DelegationEndpoint = "https://{0}/delegation";
         private const string UserInfoEndpoint = "https://{0}/userinfo?access_token={1}";
@@ -35,9 +37,16 @@ namespace Auth0.SDK
             this.domain = domain;
             this.clientId = clientId;
             this.broker = new AuthenticationBroker();
-        }
+#if WINDOWS_PHONE
+            this.RefreshTokenStorageStrategy = new IsolatedStorageTokenStorageStrategy("refresh_token");
+#else
+            this.RefreshTokenStorageStrategy = new LocalSettingsTokenStorageStrategy("refresh_token");
+#endif
+            }
 
         public Auth0User CurrentUser { get; private set; }
+
+        public ITokenStorageStrategy RefreshTokenStorageStrategy { get; set; }
 
         public string CallbackUrl
         {
@@ -58,6 +67,11 @@ namespace Auth0.SDK
         public async Task<Auth0User> LoginAsync(string connection = "", string scope = "openid")
         {
             var user = await this.broker.AuthenticateAsync(GetStartUri(connection, scope), new Uri(this.CallbackUrl));
+
+            if (!string.IsNullOrEmpty(user.RefreshToken))
+            {
+                await this.RefreshTokenStorageStrategy.Store(user.RefreshToken);
+            }
 
             var endpoint = string.Format(UserInfoEndpoint, this.domain, user.Auth0AccessToken);
             HttpWebRequest request = (HttpWebRequest)WebRequest.Create(endpoint);
@@ -87,7 +101,7 @@ namespace Auth0.SDK
         /// <param name="userName" type="string">User name.</param>
         /// <param name="password type="string"">User password.</param>
         /// <param name="scope">Scope.</param>
-        public async Task<Auth0User> LoginAsync(string connection, string userName, string password, string scope = "openid")
+        public async Task<Auth0User> LoginAsync(string connection, string userName, string password, string scope = "openid offline_access")
         {
             var taskFactory = new TaskFactory();
 
@@ -133,6 +147,11 @@ namespace Auth0.SDK
                         else if (data.ContainsKey("access_token"))
                         {
                             this.CurrentUser = new Auth0User(data);
+
+                            if (!string.IsNullOrEmpty(this.CurrentUser.RefreshToken))
+                            {
+                                await this.RefreshTokenStorageStrategy.Store(this.CurrentUser.RefreshToken);
+                            }
                         }
                         else
                         {
@@ -153,21 +172,68 @@ namespace Auth0.SDK
         /// Renews the idToken (JWT)
         /// </summary>
         /// <returns>The refreshed token.</returns>
+        /// <param name="refreshToken">The refresh token</param>
+        /// <param name="options">Additional parameters.</param>
+        public async Task<JObject> RefreshToken(
+            string refreshToken = "", 
+            Dictionary<string, string> options = null)
+        {
+            if (string.IsNullOrEmpty(refreshToken))
+            {
+                refreshToken = await this.RefreshTokenStorageStrategy.Retrieve();
+
+                if (string.IsNullOrEmpty(refreshToken))
+                {
+                    throw new InvalidOperationException(
+                        "No refresh_token was found in storage and no refresh_token was provided as parameter");
+                }
+            }
+
+            return await this.GetDelegationToken(
+                api: "app",
+                refreshToken: this.CurrentUser.IdToken,
+                options: options);
+        }
+
+        /// <summary>
+        /// Verifies if the jwt for the current user has expired.
+        /// </summary>
+        /// <returns>true if the token has expired, false otherwise.</returns>
+        /// <remarks>Must be logged in before invoking.</remarks>
+        public bool HasTokenExpired()
+        {
+            if (string.IsNullOrEmpty(this.CurrentUser.IdToken))
+            {
+                throw new InvalidOperationException("You need to either login first.");
+            }
+
+            return TokenValidator.HasExpired(this.CurrentUser.IdToken);
+        }
+
+        /// <summary>
+        /// Renews the idToken (JWT)
+        /// </summary>
+        /// <returns>The refreshed token.</returns>
         /// <remarks>The JWT must not have expired.</remarks>
-        public Task<JObject> RenewIdToken()
+        /// <param name="options">Additional parameters.</param>
+        public Task<JObject> RenewIdToken(Dictionary<string, string> options = null)
         {
             if (string.IsNullOrEmpty(this.CurrentUser.IdToken))
             {
                 throw new InvalidOperationException("You need to login first.");
             }
 
+            options = options ?? new Dictionary<string, string>();
+
+            if (!options.ContainsKey("scope"))
+            {
+                options["scope"] = "passthrough";
+            }
+
             return this.GetDelegationToken(
-                api: "auth0", 
+                api: "app", 
                 idToken: this.CurrentUser.IdToken, 
-                options: new Dictionary<string, string>
-                    {
-                        { "scope", "openid profile" }
-                    });
+                options: options);
         }
 
         /// <summary>
@@ -188,7 +254,7 @@ namespace Auth0.SDK
             if (!(string.IsNullOrEmpty(idToken) || string.IsNullOrEmpty(refreshToken)))
             {
                 throw new InvalidOperationException(
-                    "You must provide either the idToken paramenter or the refreshToken parameter, not both.");
+                    "You must provide either the idToken parameter or the refreshToken parameter, not both.");
             }
 
             if (string.IsNullOrEmpty(idToken) && string.IsNullOrEmpty(refreshToken))
@@ -245,6 +311,11 @@ namespace Auth0.SDK
                     {
                         var text = await streamReader.ReadToEndAsync();
                         delegationResult = JObject.Parse(text);
+                        JToken retrievedRefresh;
+                        if (delegationResult.TryGetValue("refresh_token", out retrievedRefresh))
+                        {
+                            await this.RefreshTokenStorageStrategy.Store(retrievedRefresh.Value<string>());
+                        }
                     }
                 }
             }
@@ -275,9 +346,11 @@ namespace Auth0.SDK
                 chars[i] = (char)rand.Next((int)'a', (int)'z' + 1);
             }
 
+            var deviceId = Device.GetUniqueId();
+
             var authorizeUri = !string.IsNullOrWhiteSpace(connection) ?
-                string.Format(AuthorizeUrl, domain, clientId, Uri.EscapeDataString(scope), Uri.EscapeDataString(this.CallbackUrl), connection) :
-                string.Format(LoginWidgetUrl, domain, clientId, Uri.EscapeDataString(scope), Uri.EscapeDataString(this.CallbackUrl));
+                string.Format(AuthorizeUrl, domain, clientId, Uri.EscapeDataString(scope), Uri.EscapeDataString(this.CallbackUrl), connection, Uri.EscapeDataString(deviceId)) :
+                string.Format(LoginWidgetUrl, domain, clientId, Uri.EscapeDataString(scope), Uri.EscapeDataString(this.CallbackUrl), Uri.EscapeDataString(deviceId));
 
             this.State = new string(chars);
             var startUri = new Uri(authorizeUri + "&state=" + this.State);

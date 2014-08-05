@@ -18,14 +18,15 @@ namespace SampleApp
         }
 
         private Auth0Client auth0 = new Auth0Client(
-                "contoso.auth0.com",
-                "cEPMBtnqXQdFBuUyJeAugh6W7kLIoepB");
+                "dschenkelman.auth0.com",
+                "nC64dOssVWaZlg0PzyPtIgWFCztQUQm5");
 
         private async void Button_Click(object sender, RoutedEventArgs e)
         {
             try
             {
                 await auth0.LoginAsync();
+                var token = await auth0.RefreshToken();
                 //var user = await auth0.LoginAsync("google-oauth2");
                 //var user = await auth0.LoginAsync("sql-azure-database", "foo@dasd.com", "bar");
             }
